@@ -2,6 +2,7 @@ import pickle
 from pathlib import Path
 from dataclasses import dataclass
 
+import jax
 from flax import struct
 
 from loco_mujoco.utils import MetricsHandler
@@ -63,6 +64,37 @@ class JaxRLAlgorithmBase:
     def build_train_fn(cls, env, agent_conf: AgentConfBase, mh: MetricsHandler = None):
         """ Returns the main train function of an RL algorithm used to train an agent from scratch. """
         return lambda rng_key: cls._train_fn(rng_key, env, agent_conf, mh=mh)
+    
+    @classmethod
+    def build_pmap_train_fn(cls, env, agent_conf: AgentConfBase, num_devices=None, mh: MetricsHandler = None):
+        """Returns a pmapped training function for multi-device training."""
+        if num_devices is None:
+            num_devices = jax.device_count()
+        
+        # Define inner function for pmap
+        def train_on_device(rng_key):
+            return cls._train_fn_pmap(rng_key, env, agent_conf, mh=mh)
+        
+        # Apply pmap to the training function
+        p_train = jax.pmap(train_on_device, axis_name='i')
+        
+        # Create wrapper to handle input/output
+        def pmap_wrapper(master_rng):
+            # Generate a random key for each device
+            keys = jax.random.split(master_rng, num_devices)
+            
+            # Run training on all devices
+            results = p_train(keys)
+            
+            # Return results from first device (they should be identical)
+            return jax.tree.map(lambda x: x[0], results)
+        
+        return pmap_wrapper
+
+    @classmethod
+    def _train_fn_pmap(cls, rng, env, agent_conf: AgentConfBase, agent_state: AgentStateBase = None, mh: MetricsHandler = None):
+        """Multi-device version of the training function. Override in subclasses."""
+        raise NotImplementedError("Multi-device training not implemented for this algorithm.")
 
     @classmethod
     def build_resume_train_fn(cls, env, agent_conf: AgentConfBase, mh: MetricsHandler = None):

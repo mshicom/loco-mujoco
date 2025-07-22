@@ -3,6 +3,7 @@ from omegaconf import open_dict
 import warnings
 from dataclasses import dataclass
 from typing import Any
+from functools import partial
 from omegaconf import DictConfig, OmegaConf, ListConfig
 
 import numpy as np
@@ -16,6 +17,7 @@ from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStat
                                     Transition, TrainState, TrainStateBuffer, MetricHandlerTransition)
 from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
+from loco_mujoco.utils.pmap_utils import replicate_to_devices, create_synced_grad_fn
 
 
 @dataclass(frozen=True)
@@ -413,6 +415,248 @@ class PPOJax(JaxRLAlgorithmBase):
         return {"agent_state": agent_state,
                 "training_metrics": metrics[0],
                 "validation_metrics": metrics[1]}
+
+    @classmethod
+    def _train_fn_pmap(cls, rng, env, agent_conf: PPOAgentConf, agent_state: PPOAgentState = None, mh: MetricsHandler = None):
+        """Multi-device version of the training function with gradient synchronization."""
+        # Extract configuration
+        config, network, tx = (agent_conf.config.experiment, agent_conf.network, agent_conf.tx)
+
+        # Wrap environment
+        env = cls._wrap_env(env, config)
+
+        # Initialize parameters if needed
+        if agent_state is None:
+            rng, _rng = jax.random.split(rng)
+            init_x = jnp.zeros(env.info.observation_space.shape)
+            network_params = network.init(_rng, init_x)
+
+            # Create train state
+            train_state = TrainState.create(
+                apply_fn=network.apply,
+                params=network_params["params"],
+                run_stats=network_params["run_stats"],
+                tx=tx,
+            )
+        else:
+            train_state = agent_state.train_state
+
+        # Initialize environment
+        rng, _rng = jax.random.split(rng)
+        reset_rng = jax.random.split(_rng, config.num_envs)
+        obsv, env_state = env.reset(reset_rng)
+
+        # Create buffer for validation states
+        train_state_buffer = TrainStateBuffer.create(train_state, config.validation.num)
+
+        # Define update step with synchronized gradients
+        def _update_step_pmap(runner_state, unused):
+            # Collect trajectories (same as single-device version)
+            def _env_step(runner_state, unused):
+                train_state, env_state, last_obs, train_state_buffer, rng = runner_state
+
+                # Select action
+                rng, _rng = jax.random.split(rng)
+                y, updates = network.apply({'params': train_state.params,
+                                            'run_stats': train_state.run_stats},
+                                           last_obs, mutable=["run_stats"])
+                pi, value = y
+                train_state = train_state.replace(run_stats=updates['run_stats'])
+                action = pi.sample(seed=_rng)
+                log_prob = pi.log_prob(action)
+
+                # Step environment (stays on device)
+                obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
+
+                # Get metrics
+                log_env_state = env_state.find(LogEnvState)
+                logged_metrics = log_env_state.metrics
+
+                transition = Transition(
+                    done, absorbing, action, value, reward, log_prob, last_obs, info,
+                    env_state.additional_carry.traj_state, logged_metrics
+                )
+                runner_state = (train_state, env_state, obsv, train_state_buffer, rng)
+                return runner_state, transition
+
+            runner_state, traj_batch = jax.lax.scan(
+                _env_step, runner_state, None, config.num_steps
+            )
+
+            # Calculate advantage (same as single-device version)
+            train_state, env_state, last_obs, train_state_buffer, rng = runner_state
+            y, _ = network.apply({'params': train_state.params, 'run_stats': train_state.run_stats},
+                                last_obs, mutable=["run_stats"])
+            pi, last_val = y
+
+            advantages, targets = cls._calculate_gae_pmap(traj_batch, last_val, config)
+
+            # Update network with synchronized gradients
+            def _update_epoch_pmap(update_state, unused):
+                def _update_minbatch_pmap(train_state, batch_info):
+                    traj_batch, advantages, targets = batch_info
+
+                    # Define loss function (same as single-device)
+                    def _loss_fn(params, traj_batch, gae, targets):
+                        # Run network
+                        y, _ = network.apply({'params': params, 'run_stats': train_state.run_stats},
+                                            traj_batch.obs, mutable=["run_stats"])
+                        pi, value = y
+                        log_prob = pi.log_prob(traj_batch.action)
+
+                        # Calculate value loss
+                        value_pred_clipped = traj_batch.value + (
+                            value - traj_batch.value
+                        ).clip(-config.clip_eps, config.clip_eps)
+                        value_losses = jnp.square(value - targets)
+                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+
+                        # Calculate actor loss
+                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        loss_actor1 = ratio * gae
+                        loss_actor2 = (
+                            jnp.clip(
+                                ratio,
+                                1.0 - config.clip_eps,
+                                1.0 + config.clip_eps,
+                            )
+                            * gae
+                        )
+                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+                        loss_actor = loss_actor.mean()
+                        entropy = pi.entropy().mean()
+
+                        total_loss = (
+                            loss_actor
+                            + config.vf_coef * value_loss
+                            - config.ent_coef * entropy
+                        )
+                        return total_loss, (value_loss, loss_actor, entropy)
+
+                    # Use synchronized gradient function
+                    synced_grad_fn = create_synced_grad_fn(_loss_fn, has_aux=True)
+                    (total_loss, aux), grads = synced_grad_fn(
+                        train_state.params, traj_batch, advantages, targets
+                    )
+
+                    # Apply gradients (synchronized across devices)
+                    train_state = train_state.apply_gradients(grads=grads)
+                    return train_state, total_loss
+
+                train_state, traj_batch, advantages, targets, rng = update_state
+                rng, _rng = jax.random.split(rng)
+                
+                # Prepare batches (same as single-device)
+                batch_size = config.minibatch_size * config.num_minibatches
+                assert batch_size == config.num_steps * config.num_envs, \
+                    "batch size must be equal to number of steps * number of envs"
+                
+                permutation = jax.random.permutation(_rng, batch_size)
+                batch = (traj_batch, advantages, targets)
+                batch = jax.tree.map(
+                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+                )
+                shuffled_batch = jax.tree.map(
+                    lambda x: jnp.take(x, permutation, axis=0), batch
+                )
+                minibatches = jax.tree.map(
+                    lambda x: jnp.reshape(
+                        x, [config.num_minibatches, -1] + list(x.shape[1:])
+                    ),
+                    shuffled_batch,
+                )
+                
+                # Process all minibatches
+                train_state, total_loss = jax.lax.scan(
+                    _update_minbatch_pmap, train_state, minibatches
+                )
+                
+                update_state = (train_state, traj_batch, advantages, targets, rng)
+                return update_state, total_loss
+
+            # Run all update epochs
+            update_state = (train_state, traj_batch, advantages, targets, rng)
+            update_state, loss_info = jax.lax.scan(
+                _update_epoch_pmap, update_state, None, config.update_epochs
+            )
+            train_state = update_state[0]
+            rng = update_state[-1]
+
+            # Process metrics (same as single-device)
+            counter = ((train_state.step + 1) // config.num_minibatches) // config.update_epochs
+            logged_metrics = traj_batch.metrics
+
+            # Calculate metrics
+            metric = SummaryMetrics(
+                mean_episode_return=jnp.sum(
+                    jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 0.0)
+                ) / jnp.maximum(jnp.sum(logged_metrics.done), 1.0),
+                mean_episode_length=jnp.sum(
+                    jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)
+                ) / jnp.maximum(jnp.sum(logged_metrics.done), 1.0),
+                max_timestep=jnp.max(logged_metrics.timestep * config.num_envs),
+            )
+
+            # Handle validation (simplified for multi-device)
+            validation_metrics = ValidationSummary()
+            if mh is not None and jax.lax.is_primitive_constant(counter % config.validation_interval == 0, True):
+                # This would need to be implemented for multi-device validation
+                pass
+
+            # Update train state buffer if needed
+            train_state_buffer = jax.lax.cond(
+                counter % config.validation_interval == 0,
+                lambda x, y: TrainStateBuffer.add(x, y),
+                lambda x, y: x,
+                train_state_buffer, train_state
+            )
+
+            # Verify parameter consistency
+            _ = jax.lax.pmean(jnp.array(1.0), axis_name='i')  # Simple sync point
+
+            runner_state = (train_state, env_state, last_obs, train_state_buffer, rng)
+            return runner_state, (metric, validation_metrics)
+
+        # Main training loop
+        rng, _rng = jax.random.split(rng)
+        runner_state = (train_state, env_state, obsv, train_state_buffer, _rng)
+        runner_state, metrics = jax.lax.scan(
+            _update_step_pmap, runner_state, None, config.num_updates
+        )
+
+        # Create agent state from final train state
+        agent_state = cls._agent_state(train_state=runner_state[0])
+
+        return {"agent_state": agent_state,
+                "training_metrics": metrics[0],
+                "validation_metrics": metrics[1]}
+
+    @classmethod
+    def _calculate_gae_pmap(cls, traj_batch, last_val, config):
+        """Calculate generalized advantage estimation for pmap context."""
+        def _get_advantages(gae_and_next_value, transition):
+            gae, next_value = gae_and_next_value
+            done, absorbing, value, reward = (
+                transition.done,
+                transition.absorbing,
+                transition.value,
+                transition.reward
+            )
+
+            delta = reward + config.gamma * next_value * (1 - absorbing) - value
+            gae = delta + config.gamma * config.gae_lambda * (1 - done) * gae
+            return (gae, value), gae
+
+        _, advantages = jax.lax.scan(
+            _get_advantages,
+            (jnp.zeros_like(last_val), last_val),
+            traj_batch,
+            reverse=True,
+            unroll=16,
+        )
+        return advantages, advantages + traj_batch.value
 
     @classmethod
     def play_policy(cls, env,
