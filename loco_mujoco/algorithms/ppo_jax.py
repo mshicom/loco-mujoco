@@ -415,31 +415,39 @@ class PPOJax(JaxRLAlgorithmBase):
         return {"agent_state": agent_state,
                 "training_metrics": metrics[0],
                 "validation_metrics": metrics[1]}
+        
+    @classmethod
+    def _initialize_params(cls, rng, env, agent_conf):
+        """Initialize parameters on host/CPU to ensure consistency across devices."""
+        network, tx = (agent_conf.network, agent_conf.tx)
+        
+        # Initialize network parameters using the wrapped environment's observation shape
+        init_x = jnp.zeros(env.info.observation_space.shape)
+        network_params = network.init(rng, init_x)
+        
+        # Create train state
+        train_state = TrainState.create(
+            apply_fn=network.apply,
+            params=network_params["params"],
+            run_stats=network_params["run_stats"],
+            tx=tx,
+        )
+        
+        # Create agent state
+        agent_state = cls._agent_state(train_state=train_state)
+        
+        return agent_state
+    
 
     @classmethod
-    def _train_fn_pmap(cls, rng, env, agent_conf: PPOAgentConf, agent_state: PPOAgentState = None, mh: MetricsHandler = None):
-        """Multi-device version of the training function with gradient synchronization."""
+    def _train_fn_pmap(cls, rng, env, agent_conf: PPOAgentConf, agent_state: PPOAgentState, mh: MetricsHandler = None):
+        """Multi-device version of the training function with gradient synchronization.
+        
+        Parameters are expected to be already initialized and replicated if agent_state
+        is provided, ensuring consistency across devices.
+        """
         # Extract configuration
-        config, network, tx = (agent_conf.config.experiment, agent_conf.network, agent_conf.tx)
-
-        # Wrap environment
-        env = cls._wrap_env(env, config)
-
-        # Initialize parameters if needed
-        if agent_state is None:
-            rng, _rng = jax.random.split(rng)
-            init_x = jnp.zeros(env.info.observation_space.shape)
-            network_params = network.init(_rng, init_x)
-
-            # Create train state
-            train_state = TrainState.create(
-                apply_fn=network.apply,
-                params=network_params["params"],
-                run_stats=network_params["run_stats"],
-                tx=tx,
-            )
-        else:
-            train_state = agent_state.train_state
+        config, network, train_state = (agent_conf.config.experiment, agent_conf.network, agent_state.train_state)
 
         # Initialize environment
         rng, _rng = jax.random.split(rng)

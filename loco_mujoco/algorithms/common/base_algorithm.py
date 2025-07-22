@@ -67,29 +67,42 @@ class JaxRLAlgorithmBase:
     
     @classmethod
     def build_pmap_train_fn(cls, env, agent_conf: AgentConfBase, num_devices=None, mh: MetricsHandler = None):
-        """Returns a pmapped training function for multi-device training."""
+        """Returns a pmapped training function for multi-device training.
+        
+        Initializes parameters on one device first, then replicates to all devices to 
+        ensure consistency from the beginning of training.
+        """
         if num_devices is None:
             num_devices = jax.device_count()
         
-        # Define inner function for pmap
-        def train_on_device(rng_key):
-            return cls._train_fn_pmap(rng_key, env, agent_conf, mh=mh)
+        # Wrap the environment once
+        config = agent_conf.config.experiment
+        wrapped_env = cls._wrap_env(env, config)
         
-        # Apply pmap to the training function
-        p_train = jax.pmap(train_on_device, axis_name='i')
-        
-        # Create wrapper to handle input/output
-        def pmap_wrapper(master_rng):
+        # Initialize parameters and agent state on CPU/host
+        def train_wrapper(master_rng):
+            # Initialize parameters on host/CPU
+            init_rng, train_rng = jax.random.split(master_rng)
+            
+            # Pre-initialize agent_state
+            agent_state = cls._initialize_params(init_rng, wrapped_env, agent_conf)
+            
             # Generate a random key for each device
-            keys = jax.random.split(master_rng, num_devices)
+            device_rngs = jax.random.split(train_rng, num_devices)
+            
+            # Apply pmap to the training function
+            p_train = jax.pmap(
+                lambda rng: cls._train_fn_pmap(rng, wrapped_env, agent_conf, agent_state, mh),
+                axis_name='i'
+            )
             
             # Run training on all devices
-            results = p_train(keys)
+            results = p_train(device_rngs)
             
             # Return results from first device (they should be identical)
             return jax.tree.map(lambda x: x[0], results)
         
-        return pmap_wrapper
+        return train_wrapper
 
     @classmethod
     def _train_fn_pmap(cls, rng, env, agent_conf: AgentConfBase, agent_state: AgentStateBase = None, mh: MetricsHandler = None):
